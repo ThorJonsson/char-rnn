@@ -77,7 +77,7 @@ if opt.gpuid >= 0 and opt.opencl == 1 then
         opt.gpuid = -1 -- overwrite user setting
     end
 end
--- Seed for random generator
+-- Seed for random generator Can we change this?
 torch.manualSeed(opt.seed)
 
 -- load the model checkpoint
@@ -85,73 +85,84 @@ if not lfs.attributes(opt.model, 'mode') then
     gprint('Error: File ' .. opt.model .. ' does not exist. Are you sure you didn\'t forget to prepend cv/ ?')
 end
 checkpoint = torch.load(opt.model) -- save checkpoints
-protos = checkpoint.protos
+protos = checkpoint.protos -- What is protos?
+print(type(protos)..'\n')
 protos.rnn:evaluate() -- put in eval mode so that dropout works properly
 
 -- initialize the vocabulary (and its inverted version)
 local vocab = checkpoint.vocab
-local ivocab = {}
-for c,i in pairs(vocab) do ivocab[i] = c end
-
+local ivocab = {} --ivocab is where our text comes from
+for c,i in pairs(vocab) do ivocab[i] = c end -- We need to figure out how to connect possible outputs of ivocab with their probabilities
+-- Can we do a look ahed? Can we see a few letters in advance? Can we look at the neurons that decide the length of the word? i.e. the neurons that are 
+-- sensitive to where we should insert newline characters
 -- initialize the rnn state to all zeros
 gprint('creating an ' .. checkpoint.opt.model .. '...')
 local current_state
 current_state = {}
 for L = 1,checkpoint.opt.num_layers do
     -- c and h for all layers
-    local h_init = torch.zeros(1, checkpoint.opt.rnn_size):double()
-    if opt.gpuid >= 0 and opt.opencl == 0 then h_init = h_init:cuda() end
+    local h_init = torch.zeros(1, checkpoint.opt.rnn_size):double() -- h_init  is an empty tensor
+    if opt.gpuid >= 0 and opt.opencl ==0 then h_init = h_init:cuda() end
     if opt.gpuid >= 0 and opt.opencl == 1 then h_init = h_init:cl() end
     table.insert(current_state, h_init:clone())
-    if checkpoint.opt.model == 'lstm' then
+    if checkpoint.opt.model == 'lstm' then -- we always use lstm other rnn's have bad long term memomry i.e. they are not sensitive enough to context
+            -- see vanishing gradient problem
         table.insert(current_state, h_init:clone())
     end
 end
 state_size = #current_state
+print(state_size .. '\n')
 
 -- do a few seeded timesteps What are seeded timesteps
 local csv_table = csvigo.load({path = opt.csvFile, mode = 'large'})
-for j=1, 100 do 
-local seed_text = csv_table[j+1][1] .. ','
---print(opt.length..'\n')
-if string.len(seed_text) > 0 then
---    gprint('seeding with ' .. seed_text)
---    gprint('--------------------------')
-    for c in seed_text:gmatch'.' do
-        prev_char = torch.Tensor{vocab[c]}
-        io.write(ivocab[prev_char[1]])
-        if opt.gpuid >= 0 and opt.opencl == 0 then prev_char = prev_char:cuda() end
-        if opt.gpuid >= 0 and opt.opencl == 1 then prev_char = prev_char:cl() end
+
+-- Before we get started can we provide the future context?
+-- Such as by looking at the words ahead in the table?
+-- Doing this we would only go through the first column
+-- Can we implement something like that
+-- before we can do this we need to understand lst, vocab and protos, prediction etc. properly
+for j=1, 100 do
+    local seed_text = csv_table[j+1][1] .. ','
+    --print(opt.length..'\n')
+    if string.len(seed_text) > 0 then
+        -- All we are doing here is to provide the context, i.e. the word which should be corrected
+        for c in seed_text:gmatch'.' do
+            prev_char = torch.Tensor{vocab[c]} --I think this is a tensor
+            -- Look at what this is!
+            io.write(ivocab[prev_char[1]])
+            if opt.gpuid >= 0 and opt.opencl == 0 then prev_char = prev_char:cuda() end
+            if opt.gpuid >= 0 and opt.opencl == 1 then prev_char = prev_char:cl() end
+            -- what is lst, how can we use this to get the look ahead?
+            local lst = protos.rnn:forward{prev_char, unpack(current_state)}
+            -- lst is a list of [state1,state2,..stateN,output]. We want everything but last piece
+            current_state = {}
+            for i=1,state_size do table.insert(current_state, lst[i]) end
+                prediction = lst[#lst] -- last element holds the log probabilities
+        end
+    end
+    --endToken = '\n'
+    --start sampling/argmaxing
+    while currToken ~= '\n' do
+        -- log probabilities from the previous timestep
+        if opt.sample == 0 then
+            -- use argmax
+            local _, prev_char_ = prediction:max(2) -- what is prediction
+            prev_char = prev_char_:resize(1)
+        else
+            -- use sampling
+            prediction:div(1) -- scale by temperature
+            local probs = torch.exp(prediction):squeeze()
+            probs:div(torch.sum(probs)) -- renormalize so probs sum to one
+            prev_char = torch.multinomial(probs:float(), 1):resize(1):float()
+        end
+    
+        -- forward the rnn for next character
         local lst = protos.rnn:forward{prev_char, unpack(current_state)}
-        -- lst is a list of [state1,state2,..stateN,output]. We want everything but last piece
         current_state = {}
         for i=1,state_size do table.insert(current_state, lst[i]) end
         prediction = lst[#lst] -- last element holds the log probabilities
+        currToken = ivocab[prev_char[1]]
+        io.write(ivocab[prev_char[1]])
     end
-end
-endToken = ""
---start sampling/argmaxing
-while endToken ~= '\n' do
-    -- log probabilities from the previous timestep
-    if opt.sample == 0 then
-        -- use argmax
-        local _, prev_char_ = prediction:max(2) -- what is prediction
-        prev_char = prev_char_:resize(1)
-    else
-        -- use sampling
-        prediction:div(1) -- scale by temperature
-        local probs = torch.exp(prediction):squeeze()
-        probs:div(torch.sum(probs)) -- renormalize so probs sum to one
-        prev_char = torch.multinomial(probs:float(), 1):resize(1):float()
-    end
-
-    -- forward the rnn for next character
-    local lst = protos.rnn:forward{prev_char, unpack(current_state)}
-    current_state = {}
-    for i=1,state_size do table.insert(current_state, lst[i]) end
-  prediction = lst[#lst] -- last element holds the log probabilities
-    endToken = ivocab[prev_char[1]]
-    io.write(ivocab[prev_char[1]])
-end
 end
 io.write('\n') io.flush()
